@@ -1,0 +1,20 @@
+version: '3'
+services:
+  libretranslate:
+    image: libretranslate/libretranslate:latest
+    ports:
+      - "5050:5000"
+    environment:
+      - LT_LOAD_ONLY=en,es,fr,de,it,pt,ru,zh,ja,ko,ar
+    command: --debug
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/languages"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    volumes:
+      - libretranslate-data:/home/libretranslate
+    restart: unless-stopped
+
+volumes:
+  libretranslate-data: 
