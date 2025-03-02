@@ -66,6 +66,16 @@ const findTranslations = db.prepare(`
   WHERE website_id = ? AND language = ? AND path = ?
 `);
 
+// Add this near other SQL statements at the top
+const getTranslation = db.prepare(`
+  SELECT t.translated_text 
+  FROM translations t
+  JOIN websites w ON t.website_id = w.id
+  WHERE w.domain = ?
+  AND t.original_text = ? 
+  AND t.language = ?
+`);
+
 // Function to extract domain from URL
 function getDomain(url) {
   return new URL(url).hostname;
@@ -330,6 +340,20 @@ app.get('/view/:domain', async (req, res) => {
       }
     });
 
+    // Then modify the translation lookup in the view endpoint
+    const elements = $('h1, h2, h3, h4, h5, h6, p, span, a, button');
+    elements.each((i, el) => {
+      const $el = $(el);
+      const originalText = $el.text().trim();
+      if (originalText) {
+        // Get translation from database
+        const translation = getTranslation.get(domain, originalText, language);
+        if (translation?.translated_text) {
+          $el.text(translation.translated_text);
+        }
+      }
+    });
+
     // Send modified HTML
     res.send($.html());
 
@@ -338,141 +362,254 @@ app.get('/view/:domain', async (req, res) => {
     res.status(500).send(`Error loading translated website: ${error.message}`);
   }
 });
+
+// Add a helper function to get website ID
+const getWebsiteByDomain = db.prepare(`
+  SELECT id, domain FROM websites WHERE domain = ?
+`);
 
 // Add a separate route for paths
 app.get('/view/:domain/*', async (req, res) => {
   try {
     const { domain } = req.params;
-    const path = '/' + (req.params[0] || '');
-    const language = req.query.lang || 'en';
+    const path = req.params[0] || '';
+    const lang = req.query.lang || 'en';
 
-    console.log('Serving translated website:', { domain, path, language });
+    console.log('View request:', { domain, path, lang });
 
-    // Get website ID
-    const website = findWebsite.get(domain);
-    console.log('Found website:', website);
-    
+    // Verify website exists
+    const website = getWebsiteByDomain.get(domain);
     if (!website) {
-      return res.status(404).send('Website not found');
+      throw new Error(`Website not found: ${domain}`);
     }
 
-    // Get translations for this path
-    const getTranslations = db.prepare(`
-      SELECT original_text, translated_text, element_type
-      FROM translations
-      WHERE website_id = ? AND path = ? AND language = ?
-    `);
-    const translations = getTranslations.all(website.id, path, language);
-    console.log(`Found ${translations.length} translations for path ${path}`);
+    // Construct the original URL
+    const protocol = domain.includes('localhost') ? 'http:' : 'https:';
+    const originalUrl = `${protocol}//${domain}/${path}`;
 
-    // Fetch original website content
-    const url = `https://${domain}${path}`;
-    console.log('Fetching content from:', url);
-    
-    const response = await axios.get(url, {
+    // Fetch the original page
+    const response = await axios.get(originalUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       }
     });
 
-    // Load HTML content
-    const $ = cheerio.load(response.data);
-
-    // Replace content with translations - ONLY TEXT, NOTHING ELSE
-    translations.forEach(translation => {
-      const selector = `${translation.element_type}:contains("${translation.original_text}")`;
-      $(selector).each((i, el) => {
-        const $el = $(el);
-        
-        // Walk through all text nodes and replace ONLY text content
-        function walkAndReplace(node) {
-          if (node.nodeType === 3) { // Text node
-            if (node.nodeValue.includes(translation.original_text)) {
-              node.nodeValue = node.nodeValue.replace(
-                translation.original_text,
-                translation.translated_text || translation.original_text
-              );
-            }
-          }
-          // Continue walking through child nodes
-          node.childNodes?.forEach(walkAndReplace);
-        }
-        
-        // Start walking from the element
-        walkAndReplace(el);
-      });
+    // Load the HTML with cheerio while preserving whitespace and structure
+    const $ = cheerio.load(response.data, {
+      decodeEntities: false,
+      xmlMode: false,
+      normalizeWhitespace: false
     });
 
-    // Update all internal links to use our proxy
-    $('a').each((i, el) => {
+    // Remove any existing base tags and add our own
+    $('base').remove();
+    $('head').prepend(`<base href="${protocol}//${domain}/">`);
+
+    // Fix relative URLs
+    $('[href]').each((i, el) => {
       const href = $(el).attr('href');
-      if (href) {
-        try {
-          const hrefUrl = new URL(href, `https://${domain}`);
-          if (hrefUrl.hostname === domain) {
-            $(el).attr('href', `/view/${domain}${hrefUrl.pathname}${hrefUrl.search}?lang=${language}`);
-          }
-        } catch (e) {
-          console.log('Invalid href:', href);
-        }
+      if (href && !href.startsWith('http') && !href.startsWith('//') && !href.startsWith('mailto:') && !href.startsWith('#')) {
+        $(el).attr('href', href.startsWith('/') ? href.substring(1) : href);
       }
     });
 
-    // Fix relative paths for assets
-    $('img, script, link').each((i, el) => {
+    $('[src]').each((i, el) => {
+      const src = $(el).attr('src');
+      if (src && !src.startsWith('http') && !src.startsWith('//')) {
+        $(el).attr('src', src.startsWith('/') ? src.substring(1) : src);
+      }
+    });
+
+    // Handle inline styles
+    $('[style]').each((i, el) => {
+      let style = $(el).attr('style');
+      if (style) {
+        style = style.replace(/url\(['"]?([^'"http)]+)['"]?\)/g, (match, p1) => {
+          if (p1.startsWith('data:')) return match;
+          return `url('${p1.startsWith('/') ? p1.substring(1) : p1}')`;
+        });
+        $(el).attr('style', style);
+      }
+    });
+
+    // Handle style tags
+    $('style').each((i, el) => {
+      let css = $(el).html();
+      css = css.replace(/url\(['"]?([^'"http)]+)['"]?\)/g, (match, p1) => {
+        if (p1.startsWith('data:')) return match;
+        return `url('${p1.startsWith('/') ? p1.substring(1) : p1}')`;
+      });
+      $(el).html(css);
+    });
+
+    // Translate text content
+    const elements = $('h1, h2, h3, h4, h5, h6, p, span, a, button');
+    elements.each((i, el) => {
       const $el = $(el);
-      const src = $el.attr('src') || $el.attr('href');
-      if (src && !src.startsWith('http')) {
-        const absoluteSrc = new URL(src, `https://${domain}`).href;
-        if ($el.attr('src')) {
-          $el.attr('src', absoluteSrc);
-        } else {
-          $el.attr('href', absoluteSrc);
+      const originalText = $el.text().trim();
+      
+      if (originalText) {
+        try {
+          const translation = getTranslation.get(domain, originalText, lang);
+          if (translation?.translated_text) {
+            // Preserve HTML structure inside the element
+            const originalHtml = $el.html();
+            const translatedHtml = originalHtml.replace(originalText, translation.translated_text);
+            $el.html(translatedHtml);
+          }
+        } catch (err) {
+          console.error('Translation error:', {
+            error: err.message,
+            domain,
+            text: originalText.substring(0, 50),
+            lang
+          });
         }
       }
     });
 
-    // Send modified HTML
+    // Send the modified HTML
     res.send($.html());
 
   } catch (error) {
-    console.error('Error serving translated website:', error);
-    res.status(500).send(`Error loading translated website: ${error.message}`);
+    console.error('View endpoint error:', error);
+    res.status(500).send(`Error: ${error.message}`);
   }
 });
 
-// Add new helper function to get all links from a page
-async function getPageLinks(html, baseUrl) {
-  const $ = cheerio.load(html);
-  const links = new Set();
-  
-  $('a').each((i, el) => {
-    const href = $(el).attr('href');
-    if (href) {
-      try {
-        const url = new URL(href, baseUrl);
-        // Only include links from the same domain and with http(s) protocol
-        if (url.hostname === new URL(baseUrl).hostname && 
-            (url.protocol === 'http:' || url.protocol === 'https:')) {
-          links.add(url.pathname);
-        }
-      } catch (e) {
-        console.log('Invalid href:', href);
-      }
-    }
-  });
-  
-  return Array.from(links);
+// Add this helper function
+function isValidWebpagePath(url) {
+  // Ignore these patterns
+  const invalidPatterns = [
+    /^mailto:/,
+    /^tel:/,
+    /^#/,
+    /^javascript:/,
+    /\.(jpg|jpeg|png|gif|ico|css|js|pdf|doc|docx|zip)$/i,
+    /@/,  // Filter out email addresses
+    /^[^/]*:/  // Filter out any protocol-like strings
+  ];
+
+  // Check if URL matches any invalid pattern
+  if (invalidPatterns.some(pattern => pattern.test(url))) {
+    return false;
+  }
+
+  // Ensure it's a relative path or starts with /
+  return url.startsWith('/') || url.startsWith('./') || url.startsWith('../');
 }
 
-// Fetch website endpoint
-app.post('/api/fetch-website', async (req, res) => {
+// Modify the link extraction in map-website endpoint
+const getPageLinks = (html, baseUrl) => {
+  const $ = cheerio.load(html);
+  const links = new Set();
+
+  $('a').each((i, el) => {
+    const href = $(el).attr('href');
+    if (!href) return;
+
+    try {
+      // Handle relative and absolute URLs
+      let fullUrl;
+      try {
+        fullUrl = new URL(href, baseUrl);
+      } catch {
+        return; // Invalid URL
+      }
+
+      // Only include paths from the same domain
+      if (fullUrl.hostname === new URL(baseUrl).hostname && isValidWebpagePath(fullUrl.pathname)) {
+        links.add(fullUrl.pathname);
+      }
+    } catch (error) {
+      console.error('Error processing link:', error);
+    }
+  });
+
+  return Array.from(links);
+};
+
+// New endpoint to map website structure
+app.post('/api/map-website', async (req, res) => {
   try {
     const { url } = req.body;
-    console.log('Processing website:', { url });
+    console.log('Mapping website structure:', { url });
 
     if (!url) {
       return res.status(400).json({ error: 'URL is required' });
+    }
+
+    const parsedUrl = new URL(url);
+    const domain = parsedUrl.hostname;
+    const baseUrl = `${parsedUrl.protocol}//${domain}`;
+    
+    // Initialize queue and visited sets
+    const pagesQueue = new Set([parsedUrl.pathname]);
+    const visitedPages = new Set();
+    const foundPages = [];
+    const maxPages = 20; // Limit the number of pages to scan
+
+    while (pagesQueue.size > 0 && visitedPages.size < maxPages) {
+      const currentPath = Array.from(pagesQueue)[0];
+      pagesQueue.delete(currentPath);
+      
+      if (visitedPages.has(currentPath)) continue;
+      visitedPages.add(currentPath);
+
+      try {
+        const pageUrl = `${baseUrl}${currentPath}`;
+        const response = await axios.get(pageUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          },
+          timeout: 5000
+        });
+
+        const $ = cheerio.load(response.data);
+        const title = $('title').text() || currentPath;
+        const textCount = $('h1, h2, h3, h4, h5, h6, p, span, a, button').text().trim().length;
+        
+        foundPages.push({
+          path: currentPath,
+          title,
+          textCount
+        });
+
+        // Get new links from this page
+        const links = await getPageLinks(response.data, baseUrl);
+        links.forEach(link => {
+          if (!visitedPages.has(link)) {
+            pagesQueue.add(link);
+          }
+        });
+      } catch (error) {
+        console.error(`Error scanning page ${currentPath}:`, error.message);
+      }
+    }
+
+    res.json({
+      domain,
+      pages: foundPages,
+      totalPages: foundPages.length
+    });
+
+  } catch (error) {
+    console.error('Error mapping website:', error);
+    res.status(500).json({ 
+      error: error.message || 'Failed to map website',
+      details: error.stack
+    });
+  }
+});
+
+// Modify the existing fetch-website endpoint
+app.post('/api/fetch-website', async (req, res) => {
+  try {
+    const { url, selectedPages } = req.body;
+    console.log('Processing website:', { url, selectedPages });
+
+    if (!url || !selectedPages || !selectedPages.length) {
+      return res.status(400).json({ error: 'URL and selected pages are required' });
     }
 
     // Parse and validate URL
@@ -505,52 +642,53 @@ app.post('/api/fetch-website', async (req, res) => {
     const website = transaction();
     console.log('Using website:', website);
 
-    // Fetch website content
-    const response = await axios.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-      },
-      timeout: 10000
-    });
+    // Modify the fetching logic to only process selected pages
+    const baseUrl = `${parsedUrl.protocol}//${domain}`;
+    
+    let totalInsertedCount = 0;
 
-    const $ = cheerio.load(response.data);
-    const path = parsedUrl.pathname || '/';
+    // Process each selected page
+    for (const pagePath of selectedPages) {
+      const pageUrl = `${baseUrl}${pagePath}`;
+      const response = await axios.get(pageUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        },
+        timeout: 10000
+      });
 
-    // Store text content
-    let insertedCount = 0;
-    $('h1, h2, h3, h4, h5, h6, p, span, a, button').each((i, el) => {
-      const $el = $(el);
-      const text = $el.text().trim();
-      
-      if (text) {
-        try {
-          insertTranslation.run(
-            website.id,
-            text,
-            null,
-            'en',
-            path,
-            el.name
-          );
-          insertedCount++;
-        } catch (error) {
-          console.error('Error inserting translation:', {
-            websiteId: website.id,
-            text: text.substring(0, 50),
-            error: error.message
-          });
+      const $ = cheerio.load(response.data);
+      let insertedCount = 0;
+
+      $('h1, h2, h3, h4, h5, h6, p, span, a, button').each((i, el) => {
+        const $el = $(el);
+        const text = $el.text().trim();
+        
+        if (text) {
+          try {
+            insertTranslation.run(
+              website.id,
+              text,
+              null,
+              'en',
+              pagePath,
+              el.name
+            );
+            insertedCount++;
+          } catch (error) {
+            console.error('Error inserting translation:', error);
+          }
         }
-      }
-    });
+      });
 
-    console.log(`Successfully inserted ${insertedCount} translations`);
+      totalInsertedCount += insertedCount;
+    }
 
-    // Send response
     res.json({ 
       message: 'Website content stored successfully',
       websiteId: website.id,
       domain: website.domain,
-      translationsCount: insertedCount
+      translationsCount: totalInsertedCount
     });
 
   } catch (error) {
